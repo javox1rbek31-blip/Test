@@ -1,199 +1,424 @@
 import os
+import sys
 import json
 import asyncio
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import logging
+from collections import deque
+
+from pyrogram import Client, filters, idle
+from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait, RPCError
 from pyrogram.raw.functions.messages import Report
-from pyrogram.raw.types import InputReportReasonSpam
+from pyrogram.raw.types import InputReportReasonSpam, InputReportReasonOther
 
-# Railway Variables'dan o'qib olish
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("userbot")
 
-if SESSION_STRING:
-    app = Client("secure_packet_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
-else:
-    app = Client("secure_packet_bot", api_id=API_ID, api_hash=API_HASH)
+# ----------------------------------------------------
+# SOZLAMALAR (Railway Variables)
+# ----------------------------------------------------
+API_ID = os.getenv("API_ID", "").strip()
+API_HASH = os.getenv("API_HASH", "").strip()
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
-DB_FILE = "packets.json"
-temp_state = {}
+missing = [n for n, v in (("API_ID", API_ID), ("API_HASH", API_HASH), ("SESSION_STRING", SESSION_STRING)) if not v]
+if missing:
+    log.error("Railway Variables'da quyidagilar yo'q: %s", ", ".join(missing))
+    sys.exit(1)
+
+try:
+    API_ID = int(API_ID)
+except ValueError:
+    log.error("API_ID faqat raqamlardan iborat bo'lishi kerak")
+    sys.exit(1)
+
+# Railway Volume /data ga ulangan bo'lsa, paketlar o'sha yerda saqlanadi (deploy'da o'chmaydi)
+DATA_DIR = os.getenv("DATA_DIR") or ("/data" if os.path.isdir("/data") else ".")
+DB_FILE = os.path.join(DATA_DIR, "packets.json")
+
+app = Client(
+    "userbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING,
+    in_memory=True,
+)
+
+MY_ID = None
+MEDIA_TYPES = ("photo", "voice", "video", "video_note", "animation", "audio", "document")
+LABELS = {
+    "text": "matn", "photo": "rasm", "voice": "ovozli", "video": "video",
+    "video_note": "krujok", "animation": "GIF", "audio": "audio", "document": "fayl",
+}
+
+
+# ----------------------------------------------------
+# PAKETLAR BAZASI
+# ----------------------------------------------------
+def _normalize(packet):
+    """Eski formatdagi ({"text":..,"voice":..,"video":..}) paketlarni yangi formatga o'tkazadi."""
+    if isinstance(packet, list):
+        return packet
+    items = []
+    if isinstance(packet, dict):
+        if packet.get("text"):
+            items.append({"type": "text", "text": packet["text"]})
+        if packet.get("voice"):
+            items.append({"type": "voice", "file_id": packet["voice"]})
+        if packet.get("video"):
+            items.append({"type": "video", "file_id": packet["video"]})
+    return items
+
 
 def load_packets():
-    if os.path.exists(DB_FILE):
+    try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("packets.json o'qilmadi: %s", e)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): _normalize(v) for k, v in data.items()}
 
-def save_packets(data):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
 
-packets_db = load_packets()
+def save_packets():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = DB_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(packets, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DB_FILE)
+
+
+packets = load_packets()
+wizard = None                # {"name": str, "items": list, "status_id": int}
+sent_ids = deque(maxlen=300)  # bot o'zi yuborgan xabarlar (qayta ishlanmasligi uchun)
+
 
 # ----------------------------------------------------
-# BOSH MENYU VA KNOPKALAR ORQALI BOSHQARUV (!panel)
+# YORDAMCHI FUNKSIYALAR
 # ----------------------------------------------------
-@app.on_message(filters.me & filters.text & filters.regex(r"^!panel$"))
-async def open_panel(client, message):
-    await message.delete()
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Yangi paket qo'shish", callback_data="btn_add")],
-        [InlineKeyboardButton("📋 Paketlar ro'yxati", callback_data="btn_list")],
-        [InlineKeyboardButton("❌ Panelni yopish", callback_data="btn_close")]
-    ])
-    
-    await client.send_message(
-        message.chat.id,
-        "🎛 **Userbot Boshqaruv Paneli**\n\nKerakli tugmani tanlang:",
-        reply_markup=keyboard
+def remember(msg):
+    if msg:
+        sent_ids.append((msg.chat.id, msg.id))
+    return msg
+
+
+async def safe(call):
+    """FloodWait bo'lsa kutib, bir marta qayta urinadi."""
+    try:
+        return await call()
+    except FloodWait as e:
+        await asyncio.sleep(e.value + 1)
+        return await call()
+
+
+async def notice(message, text, delete_after=None):
+    """Buyruq xabarining o'zini javobga aylantiradi (chatda ortiqcha xabar qolmaydi)."""
+    try:
+        await message.edit_text(text)
+    except RPCError:
+        return
+    if delete_after:
+        async def _later():
+            await asyncio.sleep(delete_after)
+            try:
+                await message.delete()
+            except RPCError:
+                pass
+        asyncio.create_task(_later())
+
+
+def is_saved_messages(message):
+    return message.chat.id == MY_ID
+
+
+def panel_text():
+    lines = ["🎛 **Userbot paneli**", "", f"📦 Paketlar: **{len(packets)}** ta"]
+    if wizard:
+        lines.append(f"✍️ Yaratilmoqda: `{wizard['name']}` ({len(wizard['items'])} ta element)")
+    lines += [
+        "",
+        "**Paketlar** (Saqlangan xabarlarda):",
+        "`!add nom` — yangi paket boshlash",
+        "`!save` — paketni saqlash",
+        "`!cancel` — bekor qilish",
+        "`!list` — paketlar ro'yxati",
+        "`!del nom` — paketni o'chirish",
+        "",
+        "**Ishlatish:** istalgan chatda paket nomini yozing — bot uni o'chirib, paketni yuboradi.",
+        "",
+        "**Himoya** (xabarga reply qilib):",
+        "`!spam` — spam deb shikoyat + blok",
+        "`!scam` — firibgarlik deb shikoyat + blok",
+    ]
+    return "\n".join(lines)
+
+
+def wizard_status():
+    w = wizard
+    kinds = ", ".join(LABELS.get(i["type"], i["type"]) for i in w["items"]) or "hali yo'q"
+    text = (
+        f"✍️ **Paket:** `{w['name']}`\n"
+        f"📎 Elementlar ({len(w['items'])}): {kinds}\n\n"
+        "Shu chatga matn, rasm, ovozli, video, krujok yoki fayl yuboring — "
+        "paket shu tartibda yuboriladi.\n"
+        "Tugatish: `!save` · Bekor qilish: `!cancel`"
     )
+    if w["name"] in packets:
+        text += "\n\n⚠️ Bu nomli paket allaqachon bor — saqlasangiz almashtiriladi."
+    return text
 
-@app.on_callback_query()
-async def callback_handler(client, callback_query):
-    user_id = callback_query.from_user.id
-    data = callback_query.data
-    
-    if data == "btn_add":
-        temp_state[user_id] = {"step": "waiting_name"}
-        await callback_query.message.edit_text(
-            "✍️ **Yangi paket yaratish:**\n\nIltimos, ushbu paket uchun kalit so'z yozing (masalan: `kom01`):"
+
+async def refresh_wizard_status(client):
+    if not wizard:
+        return
+    try:
+        await client.edit_message_text(MY_ID, wizard["status_id"], wizard_status())
+    except RPCError:
+        pass
+
+
+def extract_item(message):
+    if message.text:
+        return {"type": "text", "text": message.text.html}
+    for t in MEDIA_TYPES:
+        media = getattr(message, t, None)
+        if media:
+            item = {"type": t, "file_id": media.file_id}
+            if message.caption:
+                item["caption"] = message.caption.html
+            return item
+    return None
+
+
+async def send_item(client, chat_id, item, reply_to=None):
+    t = item["type"]
+    if t == "text":
+        return await client.send_message(
+            chat_id, item["text"], parse_mode=ParseMode.HTML, reply_to_message_id=reply_to
         )
-    elif data == "btn_list":
-        if not packets_db:
-            await callback_query.answer("Hozircha paketlar yo'q!", show_alert=True)
-            return
-        
-        text = "📋 **Saqlangan paketlar:**\n\n"
-        for name in packets_db:
-            text += f"• `{name}`\n"
-        
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="btn_panel")]])
-        await callback_query.message.edit_text(text, reply_markup=keyboard)
-        
-    elif data == "btn_panel":
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Yangi paket qo'shish", callback_data="btn_add")],
-            [InlineKeyboardButton("📋 Paketlar ro'yxati", callback_data="btn_list")],
-            [InlineKeyboardButton("❌ Panelni yopish", callback_data="btn_close")]
-        ])
-        await callback_query.message.edit_text("🎛 **Userbot Boshqaruv Paneli**", reply_markup=keyboard)
-        
-    elif data == "btn_close":
-        await callback_query.message.delete()
+    method = getattr(client, f"send_{t}")
+    kwargs = {t: item["file_id"], "reply_to_message_id": reply_to}
+    if item.get("caption") and t != "video_note":
+        kwargs["caption"] = item["caption"]
+        kwargs["parse_mode"] = ParseMode.HTML
+    return await method(chat_id, **kwargs)
+
 
 # ----------------------------------------------------
-# TUGMALAR ORQALI PAKET YARATISH JARAYONI
+# BUYRUQLAR
 # ----------------------------------------------------
-@app.on_message(filters.me & filters.private)
-async def packet_wizard(client, message):
-    user_id = message.from_user.id
-    if user_id not in temp_state:
+async def cmd_panel(client, message, arg):
+    # Mijoz chatida panel 15 soniyadan keyin o'chadi
+    await notice(message, panel_text(), None if is_saved_messages(message) else 15)
+
+
+async def cmd_add(client, message, arg):
+    global wizard
+    if not is_saved_messages(message):
+        await notice(message, "⚠️ Paketni **Saqlangan xabarlar** (Saved Messages) chatida yarating.", 5)
+        return
+    name = arg.strip().lower()
+    if not name or " " in name or name.startswith("!"):
+        await notice(message, "⚠️ Format: `!add nom` — nom bitta so'z va `!` belgisisiz bo'lsin.", 8)
+        return
+    wizard = {"name": name, "items": [], "status_id": message.id}
+    await notice(message, wizard_status())
+
+
+async def cmd_save(client, message, arg):
+    global wizard
+    if not wizard:
+        await notice(message, "ℹ️ Faol paket yo'q. Boshlash: `!add nom`", 5)
+        return
+    if not wizard["items"]:
+        await notice(message, "⚠️ Paket bo'sh — avval biror narsa yuboring.", 5)
+        return
+    name, items = wizard["name"], wizard["items"]
+    old = packets.get(name)
+    packets[name] = items
+    try:
+        save_packets()
+    except OSError as e:
+        if old is None:
+            packets.pop(name, None)
+        else:
+            packets[name] = old
+        log.error("Saqlashda xato: %s", e)
+        await notice(message, f"❌ Saqlab bo'lmadi: `{e}`")
+        return
+    status_id = wizard["status_id"]
+    wizard = None
+    try:
+        await client.edit_message_text(MY_ID, status_id, f"✅ Paket `{name}` tayyor.")
+    except RPCError:
+        pass
+    await notice(message, f"🎉 Paket `{name}` saqlandi ({len(items)} ta element).", 10)
+
+
+async def cmd_cancel(client, message, arg):
+    global wizard
+    if not wizard:
+        await notice(message, "ℹ️ Bekor qiladigan narsa yo'q.", 5)
+        return
+    name = wizard["name"]
+    wizard = None
+    await notice(message, f"🚫 `{name}` paketini yaratish bekor qilindi.", 5)
+
+
+async def cmd_list(client, message, arg):
+    if not packets:
+        text = "📭 Hozircha paketlar yo'q. Yaratish: `!add nom`"
+    else:
+        rows = []
+        for name, items in sorted(packets.items()):
+            kinds = ", ".join(LABELS.get(i["type"], i["type"]) for i in items)
+            rows.append(f"• `{name}` — {kinds}")
+        text = "📋 **Saqlangan paketlar:**\n\n" + "\n".join(rows)
+    await notice(message, text, None if is_saved_messages(message) else 15)
+
+
+async def cmd_del(client, message, arg):
+    name = arg.strip().lower()
+    if not name:
+        await notice(message, "⚠️ Format: `!del nom`", 5)
+        return
+    if name not in packets:
+        await notice(message, f"⚠️ `{name}` nomli paket topilmadi.", 5)
+        return
+    removed = packets.pop(name)
+    try:
+        save_packets()
+    except OSError as e:
+        packets[name] = removed
+        await notice(message, f"❌ O'chirib bo'lmadi: `{e}`")
+        return
+    await notice(message, f"🗑 Paket `{name}` o'chirildi.", 5)
+
+
+async def cmd_report(client, message, scam):
+    target = message.reply_to_message
+    if not target:
+        await notice(message, "⚠️ Spammer xabariga **reply** qilib yozing.", 4)
+        return
+    user = target.from_user
+    if not user or user.is_self:
+        await notice(message, "⚠️ Bu xabar egasini aniqlab bo'lmadi.", 4)
         return
 
-    state = temp_state[user_id].get("step")
+    reason = InputReportReasonOther() if scam else InputReportReasonSpam()
+    comment = "Scam / fraud" if scam else "Spam"
+    results = []
 
-    # 1. Paket nomini olish
-    if state == "waiting_name":
-        p_name = message.text.strip().lower()
-        temp_state[user_id] = {
-            "name": p_name,
-            "text": None,
-            "voice": None,
-            "video": None,
-            "step": "waiting_content"
-        }
-        await message.reply(
-            f"✅ Paket nomi: **{p_name}**\n\n"
-            f"Endi ushbu paketga tegishli **Matn**, **Ovozli xabar** va **Videoni** shu chatga ketma-ket yuboring.\n"
-            f"Barchasini yuborib bo'lgach, **!save** deb yozing."
-        )
-        return
-
-    # 2. Kontentlarni qabul qilish va Saqlash
-    if state == "waiting_content":
-        if message.text and message.text.strip() == "!save":
-            p_data = temp_state[user_id]
-            p_name = p_data["name"]
-            
-            packets_db[p_name] = {
-                "text": p_data["text"],
-                "voice": p_data["voice"],
-                "video": p_data["video"]
-            }
-            save_packets(packets_db)
-            del temp_state[user_id]
-            
-            await message.reply(f"🎉 **Paket `{p_name}` muvaffaqiyatli saqlandi!**")
-            return
-
-        if message.text:
-            temp_state[user_id]["text"] = message.text
-            await message.reply("📝 Matn qabul qilindi. Davom eting yoki `!save` yozing.")
-        elif message.voice:
-            temp_state[user_id]["voice"] = message.voice.file_id
-            await message.reply("🎙 Ovozli xabar qabul qilindi. Davom eting yoki `!save` yozing.")
-        elif message.video:
-            temp_state[user_id]["video"] = message.video.file_id
-            await message.reply("🎥 Video qabul qilindi. Davom eting yoki `!save` yozing.")
-
-# ----------------------------------------------------
-# CHATLARDA PAKETNI ISHLATISH VA CHATNI TOZA SAQLASH
-# ----------------------------------------------------
-@app.on_message(filters.me & filters.text)
-async def handle_triggers_and_security(client, message):
-    text = message.text.strip().lower()
-    chat_id = message.chat.id
-
-    # Paketni yuborish
-    if text in packets_db:
-        packet = packets_db[text]
-        await message.delete()  # Trigger so'zni darhol o'chirib, chatni toza saqlaydi
-        
-        try:
-            if packet.get("text"):
-                await client.send_message(chat_id, packet["text"])
-                await asyncio.sleep(0.3)
-            if packet.get("voice"):
-                await client.send_voice(chat_id, voice=packet["voice"])
-                await asyncio.sleep(0.3)
-            if packet.get("video"):
-                await client.send_video(chat_id, video=packet["video"])
-        except Exception as e:
-            print(f"Xatolik: {e}")
-        return
-
-    # 100% HIMOYA: !spam yoki !scam buyrug'i orqali shikoyat qilib bloklash
-    if text.startswith("!spam") or text.startswith("!scam"):
-        if not message.reply_to_message:
-            await message.delete()
-            return
-            
-        user = message.reply_to_message.from_user
-        if not user:
-            return
-
-        try:
-            await message.delete()
-            # Telegram serveriga rasmiy shikoyat
-            await client.invoke(
-                Report(
-                    peer=await client.resolve_peer(user.id),
-                    id=[message.reply_to_message.id],
-                    reason=InputReportReasonSpam(),
-                    message="Spam and security protection"
-                )
+    try:
+        await client.invoke(
+            Report(
+                peer=await client.resolve_peer(message.chat.id),
+                id=[target.id],
+                reason=reason,
+                message=comment,
             )
-            # Qora ro'yxatga (Block) tiqish
-            await client.block_user(user.id)
-            
-            notif = await client.send_message(chat_id, f"🛡 Foydalanuvchi ({user.first_name}) bloklandi va shikoyat qilindi!")
-            await asyncio.sleep(3)
-            await notif.delete()
-        except Exception as e:
-            print(f"Xatolik: {e}")
+        )
+        results.append("shikoyat yuborildi")
+    except RPCError as e:
+        log.warning("Shikoyat xatosi: %s", e)
+        results.append("shikoyat yuborilmadi")
+
+    try:
+        await client.block_user(user.id)
+        results.append("bloklandi")
+    except RPCError as e:
+        log.warning("Bloklash xatosi: %s", e)
+        results.append("bloklanmadi")
+
+    icon = "🚨" if scam else "🛡"
+    await notice(message, f"{icon} {user.first_name or 'Foydalanuvchi'}: " + ", ".join(results), 3)
+
+
+COMMANDS = {
+    "!panel": cmd_panel,
+    "!add": cmd_add,
+    "!save": cmd_save,
+    "!cancel": cmd_cancel,
+    "!list": cmd_list,
+    "!del": cmd_del,
+    "!spam": lambda c, m, a: cmd_report(c, m, scam=False),
+    "!scam": lambda c, m, a: cmd_report(c, m, scam=True),
+}
+
+
+# ----------------------------------------------------
+# PAKET YUBORISH
+# ----------------------------------------------------
+async def send_packet(client, message, key):
+    chat_id = message.chat.id
+    reply_to = message.reply_to_message_id
+    try:
+        await message.delete()  # trigger so'zni o'chirib, chatni toza saqlaydi
+    except RPCError:
+        pass
+    for index, item in enumerate(packets[key]):
+        try:
+            sent = await safe(lambda: send_item(client, chat_id, item, reply_to if index == 0 else None))
+            remember(sent)
+        except RPCError as e:
+            log.warning("Paket '%s' elementi yuborilmadi: %s", key, e)
+        await asyncio.sleep(0.4)
+
+
+# ----------------------------------------------------
+# ASOSIY HANDLER (bitta handler — xabarlar bir-birini "yutib" yubormaydi)
+# ----------------------------------------------------
+@app.on_message(filters.me & ~filters.service)
+async def on_my_message(client, message):
+    if message.edit_date or (message.chat.id, message.id) in sent_ids:
+        return
+
+    text = (message.text or "").strip()
+
+    # 1. Buyruqlar
+    if text.startswith("!"):
+        cmd, _, arg = text.partition(" ")
+        handler = COMMANDS.get(cmd.lower())
+        if handler:
+            try:
+                await handler(client, message, arg)
+            except Exception as e:
+                log.exception("Buyruq xatosi (%s): %s", cmd, e)
+            return
+
+    # 2. Paket yaratish rejimi (faqat Saqlangan xabarlarda)
+    if wizard and is_saved_messages(message) and message.id != wizard["status_id"]:
+        item = extract_item(message)
+        if item:
+            wizard["items"].append(item)
+            await refresh_wizard_status(client)
+        return
+
+    # 3. Paket nomi yozilsa — paketni yuborish
+    key = text.lower()
+    if key and key in packets:
+        await send_packet(client, message, key)
+
+
+# ----------------------------------------------------
+# ISHGA TUSHIRISH
+# ----------------------------------------------------
+async def main():
+    global MY_ID
+    await app.start()
+    me = await app.get_me()
+    MY_ID = me.id
+    log.info("Userbot ishga tushdi: %s (id=%s)", me.first_name, me.id)
+    log.info("Paketlar: %d ta, fayl: %s", len(packets), DB_FILE)
+    if DATA_DIR == ".":
+        log.warning("Volume ulanmagan — paketlar har deploy'da o'chib ketadi. Railway'da /data ga Volume ulang.")
+    await idle()
+    await app.stop()
+
 
 if __name__ == "__main__":
-    print("Xavfsiz va tugmali Userbot ishga tushdi...")
-    app.run()
+    app.run(main())
