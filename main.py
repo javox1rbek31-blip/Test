@@ -5,11 +5,16 @@ import asyncio
 import logging
 from collections import deque
 
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, utils
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, RPCError
-from pyrogram.raw.functions.messages import Report
-from pyrogram.raw.types import InputReportReasonSpam, InputReportReasonOther
+from pyrogram.raw.functions.messages import Report, SaveDraft
+from pyrogram.raw.types import (
+    InputReportReasonSpam,
+    InputReportReasonOther,
+    UpdateDraftMessage,
+    DraftMessage,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("userbot")
@@ -45,6 +50,7 @@ app = Client(
 )
 
 MY_ID = None
+DRAFT_DELAY = 2  # qoralama o'zgarmay shuncha soniya tursa, paket yuboriladi
 MEDIA_TYPES = ("photo", "voice", "video", "video_note", "animation", "audio", "document")
 LABELS = {
     "text": "matn", "photo": "rasm", "voice": "ovozli", "video": "video",
@@ -95,6 +101,7 @@ def save_packets():
 packets = load_packets()
 wizard = None                # {"name": str, "items": list, "status_id": int}
 sent_ids = deque(maxlen=300)  # bot o'zi yuborgan xabarlar (qayta ishlanmasligi uchun)
+last_drafts = {}              # chat_id -> oxirgi qoralama matni
 
 
 # ----------------------------------------------------
@@ -148,7 +155,9 @@ def panel_text():
         "`!list` — paketlar ro'yxati",
         "`!del nom` — paketni o'chirish",
         "",
-        "**Ishlatish:** istalgan chatda paket nomini yozing — bot uni o'chirib, paketni yuboradi.",
+        "**Ishlatish (tavsiya):** lid chatida paket nomini yozing, lekin **yubormang** — "
+        "chatlar ro'yxatiga chiqing. Nom lidga umuman bormaydi, bot paketni o'zi yuboradi.",
+        "Yuborib yuborsangiz ham ishlaydi, lekin nom bir lahzaga lidga boradi.",
         "",
         "**Himoya** (xabarga reply qilib):",
         "`!spam` — spam deb shikoyat + blok",
@@ -353,20 +362,62 @@ COMMANDS = {
 # ----------------------------------------------------
 # PAKET YUBORISH
 # ----------------------------------------------------
-async def send_packet(client, message, key):
-    chat_id = message.chat.id
-    reply_to = message.reply_to_message_id
-    try:
-        await message.delete()  # trigger so'zni o'chirib, chatni toza saqlaydi
-    except RPCError:
-        pass
-    for index, item in enumerate(packets[key]):
+async def deliver_packet(client, chat_id, key, reply_to=None):
+    for index, item in enumerate(packets.get(key, [])):
         try:
             sent = await safe(lambda: send_item(client, chat_id, item, reply_to if index == 0 else None))
             remember(sent)
         except RPCError as e:
             log.warning("Paket '%s' elementi yuborilmadi: %s", key, e)
         await asyncio.sleep(0.4)
+
+
+async def send_packet(client, message, key):
+    """Paket nomi yuborilgan holat: nomni o'chirib, paketni yuboradi."""
+    chat_id = message.chat.id
+    reply_to = message.reply_to_message_id
+    try:
+        await message.delete()
+    except RPCError:
+        pass
+    await deliver_packet(client, chat_id, key, reply_to)
+
+
+# ----------------------------------------------------
+# QORALAMA ORQALI PAKET (nom lidga umuman yuborilmaydi)
+# ----------------------------------------------------
+async def handle_draft(client, update, chat_id, text):
+    await asyncio.sleep(DRAFT_DELAY)
+    if last_drafts.get(chat_id) != text:
+        return  # hali yozilyapti yoki qoralama o'zgardi
+    last_drafts[chat_id] = ""
+
+    try:
+        await client.invoke(SaveDraft(peer=await client.resolve_peer(chat_id), message=""))
+    except RPCError as e:
+        log.warning("Qoralamani tozalab bo'lmadi: %s", e)
+
+    log.info("Qoralama orqali paket '%s' -> %s", text, chat_id)
+    await deliver_packet(client, chat_id, text, getattr(update, "top_msg_id", None))
+
+
+@app.on_raw_update(group=1)
+async def on_raw(client, update, users, chats):
+    if not isinstance(update, UpdateDraftMessage):
+        return
+    try:
+        chat_id = utils.get_peer_id(update.peer)
+    except Exception:
+        return
+
+    draft = update.draft
+    text = ""
+    if isinstance(draft, DraftMessage) and draft.message:
+        text = draft.message.strip().lower()
+    last_drafts[chat_id] = text
+
+    if text and text in packets and chat_id != MY_ID:
+        asyncio.create_task(handle_draft(client, update, chat_id, text))
 
 
 # ----------------------------------------------------
